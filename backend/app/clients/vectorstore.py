@@ -8,7 +8,7 @@ from app.core.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-_client: chromadb.PersistentClient | None = None
+_client: Any = None
 _client_path: str | None = None
 COLLECTION_NAME = "document_chunks"
 
