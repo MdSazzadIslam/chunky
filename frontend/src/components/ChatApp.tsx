@@ -1,15 +1,10 @@
 "use client";
 
-import { FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import { FormEvent, type ReactNode, useRef, useState } from "react";
 
-import {
-  getDocument,
-  sendChat,
-  SourceChunk,
-  uploadDocument,
-  validatePdf,
-  type DocumentResponse,
-} from "@/lib/api";
+import { type ChatMessage, useChat } from "@/hooks/useChat";
+import { usePdfDocument } from "@/hooks/usePdfDocument";
+import { useTheme } from "@/hooks/useTheme";
 import {
   ArrowUpIcon,
   BoltIcon,
@@ -24,15 +19,6 @@ import {
 } from "@/components/icons";
 
 type View = "chat" | "history" | "documents";
-type Role = "user" | "assistant";
-
-type ChatMessage = {
-  id: string;
-  role: Role;
-  content: string;
-  usedRag?: boolean;
-  sources?: SourceChunk[];
-};
 
 const SUGGESTIONS = [
   "Summarize this document",
@@ -44,123 +30,46 @@ const SUGGESTIONS = [
 export default function ChatApp() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [view, setView] = useState<View>("chat");
-  const [question, setQuestion] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [pdfDoc, setPdfDoc] = useState<DocumentResponse | null>(null);
-  const [busy, setBusy] = useState<"upload" | "chat" | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [dark, setDark] = useState(false);
+  const { dark, toggleTheme } = useTheme();
+  const { pdfDoc, uploading, error: documentError, uploadPdf, clearPdf, clearError: clearDocumentError } =
+    usePdfDocument();
+  const {
+    question,
+    setQuestion,
+    messages,
+    historyItems,
+    asking,
+    error: chatError,
+    canAsk,
+    ask,
+  } = useChat(pdfDoc, uploading);
 
-  useEffect(() => {
-    const stored = window.localStorage.getItem("chunky-theme");
-    const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    const next = stored ? stored === "dark" : prefersDark;
-    setDark(next);
-    applyTheme(next);
-  }, []);
-
-  useEffect(() => {
-    if (!pdfDoc || pdfDoc.status !== "processing") {
-      return;
-    }
-    const documentId = pdfDoc.document_id;
-    const timer = window.setInterval(async () => {
-      try {
-        const latest = await getDocument(documentId);
-        setPdfDoc(latest);
-        if (latest.status === "error") {
-          setError(latest.error_message || "PDF processing failed.");
-        }
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Could not check document status.");
-      }
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [pdfDoc?.document_id, pdfDoc?.status]);
-
-  const canAsk = question.trim().length > 0 && busy === null && pdfDoc?.status !== "processing";
+  const error = chatError ?? documentError;
+  const busy = uploading || asking;
 
   async function onPickPdf(fileList: FileList | null) {
     const file = fileList?.[0];
     if (!file) {
       return;
     }
-    const validationError = validatePdf(file);
-    if (validationError) {
-      setError(validationError);
-      if (fileRef.current) {
-        fileRef.current.value = "";
-      }
-      return;
-    }
-
-    setError(null);
-    setBusy("upload");
-    try {
-      const uploaded = await uploadDocument(file);
-      setPdfDoc(uploaded);
-      if (uploaded.status === "error") {
-        setError(uploaded.error_message || "PDF processing failed.");
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Upload failed.");
-      setPdfDoc(null);
-    } finally {
-      setBusy(null);
-      if (fileRef.current) {
-        fileRef.current.value = "";
-      }
+    await uploadPdf(file);
+    if (fileRef.current) {
+      fileRef.current.value = "";
     }
   }
 
-  async function ask(text: string) {
-    const cleaned = text.trim();
-    if (!cleaned || busy !== null || pdfDoc?.status === "processing") {
+  function submitAsk(text: string) {
+    if (!ask(text)) {
       return;
     }
-
-    setMessages((current) => [
-      ...current,
-      { id: crypto.randomUUID(), role: "user", content: cleaned },
-    ]);
-    setQuestion("");
-    setError(null);
-    setBusy("chat");
+    clearDocumentError();
     setView("chat");
-
-    try {
-      const documentId = pdfDoc?.status === "ready" ? pdfDoc.document_id : undefined;
-      const result = await sendChat(cleaned, documentId);
-      setMessages((current) => [
-        ...current,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: result.answer,
-          usedRag: result.used_rag,
-          sources: result.sources,
-        },
-      ]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "The request failed.");
-    } finally {
-      setBusy(null);
-    }
   }
 
   function onSubmit(event: FormEvent) {
     event.preventDefault();
-    void ask(question);
+    void submitAsk(question);
   }
-
-  function toggleTheme() {
-    const next = !dark;
-    setDark(next);
-    applyTheme(next);
-    window.localStorage.setItem("chunky-theme", next ? "dark" : "light");
-  }
-
-  const historyItems = messages.filter((message) => message.role === "user");
 
   return (
     <div className="flex h-full flex-col">
@@ -190,11 +99,11 @@ export default function ChatApp() {
 
       <main className="flex min-h-0 flex-1 flex-col px-5 pb-5 sm:px-8">
         {view === "chat" && messages.length === 0 ? (
-          <EmptyState onSuggestion={(prompt) => void ask(prompt)} />
+          <EmptyState onSuggestion={submitAsk} />
         ) : null}
 
         {view === "chat" && messages.length > 0 ? (
-          <MessageList messages={messages} thinking={busy === "chat"} />
+          <MessageList messages={messages} thinking={asking} />
         ) : null}
 
         {view === "history" ? (
@@ -244,15 +153,8 @@ export default function ChatApp() {
           {pdfDoc ? (
             <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-[var(--chip)] px-3 py-1 text-[13px]">
               <FileIcon width={14} height={14} />
-              <span>{busy === "upload" ? "Uploading…" : pdfDoc.filename}</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setPdfDoc(null);
-                  setError(null);
-                }}
-                aria-label="Remove PDF"
-              >
+              <span>{uploading ? "Uploading…" : pdfDoc.filename}</span>
+              <button type="button" onClick={clearPdf} aria-label="Remove PDF">
                 <CloseIcon />
               </button>
             </div>
@@ -264,7 +166,7 @@ export default function ChatApp() {
               type="file"
               accept="application/pdf,.pdf"
               className="hidden"
-              disabled={busy !== null}
+              disabled={busy}
               onChange={(event) => onPickPdf(event.target.files)}
             />
             <button
@@ -272,7 +174,7 @@ export default function ChatApp() {
               onClick={() => fileRef.current?.click()}
               className="flex h-10 w-10 items-center justify-center rounded-full text-[var(--muted)] hover:text-[var(--ink)]"
               aria-label="Upload PDF"
-              disabled={busy !== null}
+              disabled={busy}
             >
               <PaperclipIcon />
             </button>
@@ -302,10 +204,6 @@ export default function ChatApp() {
       </main>
     </div>
   );
-}
-
-function applyTheme(dark: boolean) {
-  document.documentElement.classList.toggle("dark", dark);
 }
 
 function Logo() {
